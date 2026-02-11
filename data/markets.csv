@@ -1,0 +1,11 @@
+product,market,netback,demand_min,demand_max
+G,Local,105,80,140
+G,Export,100,0,200
+J,Local,100,30,80
+J,Export,97,0,200
+U,Local,110,140,150
+U,Export,105,0,250
+L,Local,60,6.5,30
+L,Export,58,0,80
+F,Local,55,20,40
+F,Export,52,0,200
