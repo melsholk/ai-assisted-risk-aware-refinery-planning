@@ -65,18 +65,21 @@ def _econ_lookup(econ, typ):
     return dict(zip(sub["name"], sub["value"]))
 
 
-def build_and_solve_lp(data, verbose = True):
+def build_and_solve_lp(data, verbose=True):
     """
     Refinery planning LP with:
-      - Local minimum demand HARD (served by refinery sales + finished imports)
-      - Export minimum demand soft (unmet allowed; usually 0 anyway)
+      - Local minimum demand HARD (served by delivered volumes = refinery + finished imports)
+      - Export minimum demand soft (unmet allowed)
       - FCC has two severity modes (FCC_G and FCC_D)
       - HC competes for VGO with FCC
       - HDT upgrades selected diesel blendstocks into treated diesel stream D_TRT
       - Feed imports: e.g., VGO import to supplement CDU VGO production
-      - NEW: Hydrogen balance (H2 availability + optional H2 purchase)
+      - Hydrogen balance (H2 availability + optional H2 purchase)
 
-    Solved with scipy.optimize.linprog (HiGHS).
+    Accounting fix:
+      - q_ref[p,m] = refinery-delivered volume to market m
+      - q[p,m]     = delivered volume to market m (refinery + imports)
+      - Revenue is earned on delivered q[p,m]
     """
 
     # --- Sets ---
@@ -125,7 +128,7 @@ def build_and_solve_lp(data, verbose = True):
     unit_cost = _econ_lookup(data.economics, "unit_cost")
     cap = _econ_lookup(data.economics, "capacity")
 
-    # Hydrogen parameters (NEW)
+    # Hydrogen parameters
     h2_rate = _econ_lookup(data.economics, "h2_rate") if "h2_rate" in set(data.economics["type"]) else {}
     h2_supply = _econ_lookup(data.economics, "h2_supply") if "h2_supply" in set(data.economics["type"]) else {}
     h2_cost = _econ_lookup(data.economics, "h2_cost") if "h2_cost" in set(data.economics["type"]) else {}
@@ -187,7 +190,7 @@ def build_and_solve_lp(data, verbose = True):
     add_var("T[HC]")
     add_var("T[HDT]")
 
-    # Hydrogen purchase (NEW)
+    # Hydrogen purchase
     add_var("H2[buy]")
 
     # Feed imports (e.g., VGO)
@@ -211,7 +214,13 @@ def build_and_solve_lp(data, verbose = True):
     for p in products:
         add_var(f"Q[{p}]")
 
-    # Market sales
+    # Refinery-delivered sales by market (excludes finished imports)
+    for p in products:
+        for m in markets:
+            add_var(f"q_ref[{p},{m}]")
+
+    # Delivered sales by market (refinery + imports)
+    # (kept as q[...] so the rest of the model / reporting stays familiar)
     for p in products:
         for m in markets:
             add_var(f"q[{p},{m}]")
@@ -230,7 +239,7 @@ def build_and_solve_lp(data, verbose = True):
     # Bounds
     bounds: List[Tuple[float, float]] = [(0, None)] * n
 
-    # Sales bounds
+    # Delivered sales bounds
     for p in products:
         for m in markets:
             bounds[idx[f"q[{p},{m}]"]] = (0.0, float(dmax[(p, m)]))
@@ -244,13 +253,12 @@ def build_and_solve_lp(data, verbose = True):
         bounds[idx[f"feed_imp[{feed}]"]] = (0.0, float(mx))
 
     # H2 buy bound
-    if "H2[buy]" in idx:
-        bounds[idx["H2[buy]"]] = (0.0, float(h2_buy_cap))
+    bounds[idx["H2[buy]"]] = (0.0, float(h2_buy_cap))
 
     # --- Objective (minimize negative profit) ---
     cvec = np.zeros(n)
 
-    # Revenues
+    # Revenues (delivered volumes earn revenue)
     for p in products:
         for m in markets:
             cvec[idx[f"q[{p},{m}]"]] = -float(netback[(p, m)])
@@ -280,7 +288,7 @@ def build_and_solve_lp(data, verbose = True):
     cvec[idx["T[HC]"]] += float(unit_cost["HC"])
     cvec[idx["T[HDT]"]] += float(unit_cost["HDT"])
 
-    # Hydrogen purchase cost (NEW)
+    # Hydrogen purchase cost
     cvec[idx["H2[buy]"]] += float(h2_buy_cost)
 
     # --- Constraints ---
@@ -311,13 +319,6 @@ def build_and_solve_lp(data, verbose = True):
             row[f"x[{c}]"] = -float(crude_y[c][s])
         eq(row, 0.0)
 
-    # Feed import adds to stream availability (only VGO supported by default)
-    if "VGO" in feed_cost:
-        # y[VGO] = CDU_VGO + feed_imp[VGO]
-        # We already set y[VGO] from CDU yields in eq above, so instead allow "extra VGO"
-        # by modifying the VGO allocation constraint using feed_imp[VGO].
-        pass
-
     # 3) VGO allocation: FCC + HC <= VGO + VGO_import
     vgo_row = {"T[FCC_G]": 1.0, "T[FCC_D]": 1.0, "T[HC]": 1.0, "y[VGO]": -1.0}
     if "VGO" in feed_cost:
@@ -328,9 +329,30 @@ def build_and_solve_lp(data, verbose = True):
     ub({"T[VR]": 1.0, "y[R]": -1.0}, 0.0)
 
     # 5) Conversion yields
-    eq({"y[G_FCC]": 1.0, "T[FCC_G]": -float(unit_y[("FCC_G", "G_FCC")]), "T[FCC_D]": -float(unit_y[("FCC_D", "G_FCC")])}, 0.0)
-    eq({"y[D_FCC]": 1.0, "T[FCC_G]": -float(unit_y[("FCC_G", "D_FCC")]), "T[FCC_D]": -float(unit_y[("FCC_D", "D_FCC")])}, 0.0)
-    eq({"y[LPG]": 1.0, "T[FCC_G]": -float(unit_y[("FCC_G", "LPG")]), "T[FCC_D]": -float(unit_y[("FCC_D", "LPG")])}, 0.0)
+    eq(
+        {
+            "y[G_FCC]": 1.0,
+            "T[FCC_G]": -float(unit_y[("FCC_G", "G_FCC")]),
+            "T[FCC_D]": -float(unit_y[("FCC_D", "G_FCC")]),
+        },
+        0.0,
+    )
+    eq(
+        {
+            "y[D_FCC]": 1.0,
+            "T[FCC_G]": -float(unit_y[("FCC_G", "D_FCC")]),
+            "T[FCC_D]": -float(unit_y[("FCC_D", "D_FCC")]),
+        },
+        0.0,
+    )
+    eq(
+        {
+            "y[LPG]": 1.0,
+            "T[FCC_G]": -float(unit_y[("FCC_G", "LPG")]),
+            "T[FCC_D]": -float(unit_y[("FCC_D", "LPG")]),
+        },
+        0.0,
+    )
 
     eq({"y[D_HC]": 1.0, "T[HC]": -float(unit_y[("HC", "D_HC")])}, 0.0)
     eq({"y[N_HC]": 1.0, "T[HC]": -float(unit_y[("HC", "N_HC")])}, 0.0)
@@ -353,8 +375,7 @@ def build_and_solve_lp(data, verbose = True):
     ub({"T[HC]": 1.0}, float(cap["HC"]))
     ub({"T[HDT]": 1.0}, float(cap["HDT"]))
 
-    # 6b) Hydrogen balance (NEW): H2_req <= H2_avail + H2_buy
-    # => h2_rate_HC*T[HC] + h2_rate_HDT*T[HDT] - H2_buy <= H2_avail
+    # 6b) Hydrogen balance: H2_req <= H2_avail + H2_buy
     ub({"T[HC]": h2_rate_HC, "T[HDT]": h2_rate_HDT, "H2[buy]": -1.0}, float(h2_avail))
 
     # 7) Stream availability (treating removes material; N to reformer)
@@ -382,38 +403,36 @@ def build_and_solve_lp(data, verbose = True):
             row[f"f[{s}->{p}]"] = -1.0
         eq(row, 0.0)
 
-    # 9) Market sales balance (Q is refinery production only)
+    # 9) Refinery sales balance (Q is refinery production only)
     for p in products:
         row = {f"Q[{p}]": 1.0}
         for m in markets:
-            row[f"q[{p},{m}]"] = -1.0
+            row[f"q_ref[{p},{m}]"] = -1.0
         eq(row, 0.0)
 
-    # 9b) HARD Local minimums: q + imp >= dmin  -> -q - imp <= -dmin
+    # 9a) Delivered sales definition: delivered = refinery + finished imports
     for p in products:
-        m = local_market_name
-        row = {f"q[{p},{m}]": -1.0}
-        if (p, m) in imp_cost:
-            row[f"imp[{p},{m}]"] = -1.0
-        ub(row, -float(dmin[(p, m)]))
-
-    # 9c) SOFT Export minimums: q + imp + unmet >= dmin
-    for p in products:
-        for m in export_markets:
-            row = {f"q[{p},{m}]": -1.0, f"unmet[{p},{m}]": -1.0}
+        for m in markets:
+            row = {f"q[{p},{m}]": 1.0, f"q_ref[{p},{m}]": -1.0}
             if (p, m) in imp_cost:
                 row[f"imp[{p},{m}]"] = -1.0
-            ub(row, -float(dmin[(p, m)]))
+            eq(row, 0.0)
+
+    # 9b) HARD Local minimums (delivered): q >= dmin  -> -q <= -dmin
+    for p in products:
+        m = local_market_name
+        ub({f"q[{p},{m}]": -1.0}, -float(dmin[(p, m)]))
+
+    # 9c) SOFT Export minimums (delivered): q + unmet >= dmin
+    for p in products:
+        for m in export_markets:
+            ub({f"q[{p},{m}]": -1.0, f"unmet[{p},{m}]": -1.0}, -float(dmin[(p, m)]))
 
     # 10) Blending specs
     row = {"Q[G]": float(specs.RON_min)}
     for s in blend_map["G"]:
         if qual[s]["RON"] is None:
             raise ValueError(f"Missing RON for gasoline component {s}")
-        row[f"f[{s}->{p}]".replace(f"{p}", "G")] = -float(qual[s]["RON"])
-    # fix keys (we built row with a hack above)
-    row = {"Q[G]": float(specs.RON_min)}
-    for s in blend_map["G"]:
         row[f"f[{s}->G]"] = -float(qual[s]["RON"])
     ub(row, 0.0)
 
@@ -464,8 +483,7 @@ def build_and_solve_lp(data, verbose = True):
     fcc_d = val("T[FCC_D]")
     fcc_total = fcc_g + fcc_d
     fcc_split_df = pd.DataFrame(
-        [["FCC_G", fcc_g, 100 * fcc_g / max(fcc_total, 1e-9)],
-         ["FCC_D", fcc_d, 100 * fcc_d / max(fcc_total, 1e-9)]],
+        [["FCC_G", fcc_g, 100 * fcc_g / max(fcc_total, 1e-9)], ["FCC_D", fcc_d, 100 * fcc_d / max(fcc_total, 1e-9)]],
         columns=["mode", "throughput_kbpd", "share_%"],
     )
 
@@ -489,12 +507,14 @@ def build_and_solve_lp(data, verbose = True):
         row = {"product": p, "refinery_kbpd": val(f"Q[{p}]")}
 
         m = local_market_name
-        row[f"{m}_sales_kbpd"] = val(f"q[{p},{m}]")
+        row[f"{m}_delivered_kbpd"] = val(f"q[{p},{m}]")
+        row[f"{m}_refinery_kbpd"] = val(f"q_ref[{p},{m}]")
         row[f"{m}_import_kbpd"] = val(f"imp[{p},{m}]") if (p, m) in imp_cost else 0.0
         row[f"{m}_unmet_kbpd"] = 0.0
 
         for em in export_markets:
-            row[f"{em}_sales_kbpd"] = val(f"q[{p},{em}]")
+            row[f"{em}_delivered_kbpd"] = val(f"q[{p},{em}]")
+            row[f"{em}_refinery_kbpd"] = val(f"q_ref[{p},{em}]")
             row[f"{em}_import_kbpd"] = val(f"imp[{p},{em}]") if (p, em) in imp_cost else 0.0
             row[f"{em}_unmet_kbpd"] = val(f"unmet[{p},{em}]")
 
@@ -504,7 +524,7 @@ def build_and_solve_lp(data, verbose = True):
     # Feed imports report
     vgo_imp = val("feed_imp[VGO]") if "feed_imp[VGO]" in idx else 0.0
 
-    # Hydrogen report (NEW)
+    # Hydrogen report
     h2_req = h2_rate_HC * val("T[HC]") + h2_rate_HDT * val("T[HDT]")
     h2_buy = val("H2[buy]")
     h2_df = pd.DataFrame(
@@ -512,7 +532,7 @@ def build_and_solve_lp(data, verbose = True):
         columns=["H2_required", "H2_free_avail", "H2_purchased", "H2_short"],
     )
 
-    # Economics
+    # Economics (revenue on delivered volumes)
     revenue = sum(netback[(p, m)] * val(f"q[{p},{m}]") for p in products for m in markets)
     crude_cost_total = sum(crude_cost[c] * val(f"x[{c}]") for c in crudes)
 
@@ -529,7 +549,15 @@ def build_and_solve_lp(data, verbose = True):
     h2_purchase_cost_total = h2_buy_cost * h2_buy
     unmet_pen = sum(penalty_unmet[p] * val(f"unmet[{p},{m}]") for p in products for m in export_markets)
 
-    profit = revenue - crude_cost_total - opex - finished_import_cost_total - feed_import_cost_total - h2_purchase_cost_total - unmet_pen
+    profit = (
+        revenue
+        - crude_cost_total
+        - opex
+        - finished_import_cost_total
+        - feed_import_cost_total
+        - h2_purchase_cost_total
+        - unmet_pen
+    )
 
     econ_df = pd.DataFrame(
         [
@@ -562,7 +590,7 @@ def build_and_solve_lp(data, verbose = True):
         print("\n=== HYDROGEN BALANCE ===")
         print(h2_df.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
 
-        print("\n=== PRODUCT SALES + IMPORTS (LOCAL MINS HARD) ===")
+        print("\n=== PRODUCT DELIVERIES (split refinery vs imports) ===")
         print(prod_df.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
 
         print("\n=== ECONOMICS ===")
