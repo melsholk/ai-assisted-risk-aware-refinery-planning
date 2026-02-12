@@ -10,19 +10,16 @@ from src.cvar import solve_cvar_extensive_form
 
 
 def weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
-    """
-    Weighted quantile of values at probability q in [0,1].
-    """
-    if not (0.0 <= q <= 1.0):
-        raise ValueError("q must be in [0,1]")
+    """Weighted quantile at q in [0,1]."""
     v = np.asarray(values, dtype=float)
     w = np.asarray(weights, dtype=float)
+
     if len(v) == 0:
         return float("nan")
-    if np.any(w < 0):
-        raise ValueError("weights must be nonnegative")
-    if w.sum() <= 0:
-        raise ValueError("sum(weights) must be positive")
+    if not (0.0 <= q <= 1.0):
+        raise ValueError("q must be in [0,1]")
+    if np.any(w < 0) or w.sum() <= 0:
+        raise ValueError("weights must be nonnegative and sum to > 0")
 
     order = np.argsort(v)
     v = v[order]
@@ -31,10 +28,10 @@ def weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> floa
     return float(np.interp(q, cw, v))
 
 
-def weighted_cvar_tail(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+def weighted_cvar_lower_tail(values: np.ndarray, weights: np.ndarray, tail_mass: float) -> float:
     """
-    Weighted CVaR of values in the LOWER tail with mass (1-q).
-    Here values are profits, so this returns average of worst profits.
+    Weighted CVaR of the LOWER tail of `values`, with tail mass = tail_mass.
+    Example: tail_mass = 0.10 => mean of worst 10% outcomes.
     """
     v = np.asarray(values, dtype=float)
     w = np.asarray(weights, dtype=float)
@@ -42,19 +39,19 @@ def weighted_cvar_tail(values: np.ndarray, weights: np.ndarray, q: float) -> flo
         return float("nan")
     if w.sum() <= 0:
         return float("nan")
+    if not (0.0 < tail_mass <= 1.0):
+        raise ValueError("tail_mass must be in (0,1]")
 
-    # VaR threshold in profit space
-    var_q = weighted_quantile(v, w, q)
-
-    # Tail set: v <= var_q
-    mask = v <= var_q + 1e-12
+    q = tail_mass  # cutoff quantile for worst tail
+    var = weighted_quantile(v, w, q)
+    mask = v <= var + 1e-12
     if not np.any(mask):
-        return float(var_q)
+        return float(var)
 
     v_tail = v[mask]
     w_tail = w[mask]
     if w_tail.sum() <= 0:
-        return float(var_q)
+        return float(var)
 
     return float(np.sum(w_tail * v_tail) / np.sum(w_tail))
 
@@ -68,7 +65,11 @@ def main():
     ap.add_argument("--lams", default="0,0.1,0.3,1,3,10", help="comma-separated lambda values")
     ap.add_argument("--import_cap_risk", action="store_true")
     ap.add_argument("--include_base", action="store_true", help="Include deterministic base as scenario 'base'")
+    ap.add_argument("--out_csv", default="", help="Optional path to save results CSV (e.g., outputs/frontier.csv)")
     args = ap.parse_args()
+
+    if not (0.0 < args.alpha < 1.0):
+        raise ValueError("alpha must be in (0,1)")
 
     data = load_data(args.data_dir)
     base = default_params(data)
@@ -92,12 +93,14 @@ def main():
     lam_list = [float(x.strip()) for x in args.lams.split(",") if x.strip() != ""]
     rows = []
 
-    # Build first-stage var list once (stable ordering required)
+    # First-stage vars
     lp0 = build_lp_matrices(data, params=scenarios[0].params)
     first_stage_vars = [
         v for v in lp0["var_names"]
         if v.startswith("x[") or v.startswith("T[") or v.startswith("imp_fs[")
     ]
+
+    tail_mass = 1.0 - args.alpha  # e.g., alpha=0.90 => worst 10%
 
     for lam in lam_list:
         r = solve_cvar_extensive_form(
@@ -112,58 +115,44 @@ def main():
             rows.append({"lam": lam, "status": "FAIL", "msg": r.message})
             continue
 
-        # Expected profit is always exact from scenario losses (via r.expected_loss)
+        # Expected profit (exact)
         expected_profit = -r.expected_loss
 
-        # Compute VaR/CVaR in profit space:
-        # - if lam == 0, z/s are not incentivized -> compute post-solve from scenario profits
-        # - if lam > 0, use LP-exact z and cvar_loss
+        # Scenario profits (exact at optimum)
         profits = -np.array([r.scenario_loss[s.name] for s in scenarios], dtype=float)
 
+        # Textbook downside metrics in PROFIT SPACE:
+        # VaR_alpha(profit) = (1-alpha)-quantile of profit  (10th percentile if alpha=0.90)
+        # CVaR_alpha(profit) = mean of worst (1-alpha) profits
         if lam <= 1e-12:
-            var_profit = weighted_quantile(profits, p, args.alpha)
-            cvar_profit = weighted_cvar_tail(profits, p, args.alpha)
+            var_profit = weighted_quantile(profits, p, tail_mass)
+            cvar_profit = weighted_cvar_lower_tail(profits, p, tail_mass)
         else:
+            # LP solves VaR/CVaR in LOSS space:
+            # z = VaR_alpha(loss), CVaR_loss = z + sum p*s/(1-alpha)
+            # Convert to profit space:
             var_profit = -r.z
             cvar_profit = -r.cvar_loss
 
-        # Import contracting diagnostics (first-stage totals)
-        imp_fs_total = 0.0
-        for k, v in r.first_stage.items():
-            if k.startswith("imp_fs["):
-                imp_fs_total += float(v)
+        # Contracted import total (first-stage)
+        imp_fs_total = sum(float(v) for k, v in r.first_stage.items() if k.startswith("imp_fs["))
 
-        # Spot is second-stage (scenario-dependent). But we can still diagnose:
-        #  - spot used in each scenario (from solution losses we don't have volumes)
-        # So: compute spot-cap binding freq using scenario params and scenario-wise LP solve
-        # (Fast method: rebuild each scenario LP and solve with first-stage fixed would be heavy.)
-        # Instead, we approximate binding freq by checking if spot is "needed" via cap tightness:
-        # We'll do a light diagnostic: for each scenario, solve *its own* deterministic LP with
-        # first-stage decisions fixed (non-anticipativity), then see if any imp_spot hits cap.
-        #
-        # This is still LP and OK for n~100; if it becomes slow, we can sample scenarios.
-
-        # Fix first-stage decisions in a per-scenario LP and re-solve
+        # Spot binding diagnostic (re-solve recourse with first-stage fixed)
         spot_bind_count = 0
         spot_used_total = 0.0
-        spot_cap_total = 0.0
-
-        # Build list of first-stage values to fix
         fs_values = {k: float(v) for k, v in r.first_stage.items()}
+        from scipy.optimize import linprog
 
         for sc in scenarios:
             lp = build_lp_matrices(data, params=sc.params)
-            var_names = lp["var_names"]
             idx = lp["idx"]
             bounds = list(lp["bounds"])
 
-            # Fix first-stage vars by setting bounds [val, val]
+            # Fix first-stage vars
             for nm, vv in fs_values.items():
                 if nm in idx:
                     bounds[idx[nm]] = (vv, vv)
 
-            # Solve scenario recourse LP
-            from scipy.optimize import linprog
             res = linprog(
                 c=lp["c"],
                 A_ub=lp["A_ub"],
@@ -174,34 +163,36 @@ def main():
                 method="highs",
             )
             if not res.success:
-                # if recourse infeasible, count as bind-like stress (optional)
                 continue
 
             x = res.x
-            # Check any spot import variable hitting its spot cap (within tolerance)
             tol = 1e-6
+            bound_hit = False
+
             for (pm, capv) in sc.params.imp_spot_max.items():
                 p_, m_ = pm
                 nm = f"imp_spot[{p_},{m_}]"
                 if nm in idx:
                     val = float(x[idx[nm]])
                     spot_used_total += val
-                    spot_cap_total += float(capv)
                     if float(capv) > 0 and val >= float(capv) - tol:
-                        spot_bind_count += 1
-                        break  # count scenario once
+                        bound_hit = True
+
+            if bound_hit:
+                spot_bind_count += 1
 
         spot_bind_freq = spot_bind_count / max(len(scenarios), 1)
+        spot_used_avg = spot_used_total / max(len(scenarios), 1)
 
         rows.append(
             {
                 "lam": lam,
                 "expected_profit": expected_profit,
-                f"cvar_profit_a{args.alpha:.2f}": cvar_profit,
                 f"var_profit_a{args.alpha:.2f}": var_profit,
+                f"cvar_profit_a{args.alpha:.2f}": cvar_profit,
                 "imp_fs_total": imp_fs_total,
                 "spot_bind_freq": spot_bind_freq,
-                "spot_used_avg": spot_used_total / max(len(scenarios), 1),
+                "spot_used_avg": spot_used_avg,
                 "T_FCC_D": r.first_stage.get("T[FCC_D]", np.nan),
                 "T_FCC_G": r.first_stage.get("T[FCC_G]", np.nan),
                 "T_HC": r.first_stage.get("T[HC]", np.nan),
@@ -212,10 +203,15 @@ def main():
 
     df = pd.DataFrame(rows)
 
-    pd.set_option("display.width", 220)
+    if args.out_csv:
+        import os
+        os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
+        df.to_csv(args.out_csv, index=False)
+
+    pd.set_option("display.width", 240)
     pd.set_option("display.max_columns", 80)
 
-    print("\n=== Efficient Frontier (VaR/CVaR correct at lam=0; import contracting diagnostics) ===")
+    print("\n=== Efficient Frontier (textbook VaR/CVaR: downside profit quantiles) ===")
 
     def _fmt(v):
         if isinstance(v, (int, float, np.floating)):
