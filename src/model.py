@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Any
 import os
 import numpy as np
 import pandas as pd
 from scipy.optimize import linprog
 
+
+# -------------------------
+# Data containers
+# -------------------------
 
 @dataclass(frozen=True)
 class Specs:
@@ -29,6 +33,45 @@ class Data:
     feed_imports: pd.DataFrame
     specs: Specs = Specs()
 
+
+@dataclass(frozen=True)
+class LPParams:
+    """
+    Scenario-varying parameters.
+    """
+    # Market economics
+    netback: Dict[Tuple[str, str], float]
+    dmin: Dict[Tuple[str, str], float]
+    dmax: Dict[Tuple[str, str], float]
+
+    # Costs + capacities
+    crude_cost: Dict[str, float]
+    unit_cost: Dict[str, float]
+    cap: Dict[str, float]
+
+    # Imports (finished products)
+    imp_cost: Dict[Tuple[str, str], float]
+    imp_max: Dict[Tuple[str, str], float]          # TOTAL import cap (contract+spot)
+    imp_spot_max: Dict[Tuple[str, str], float]     # SPOT-only availability cap (scenario lever)
+
+    # Feed imports (e.g. VGO)
+    feed_cost: Dict[str, float]
+    feed_max: Dict[str, float]
+
+    # Hydrogen
+    h2_rate_HC: float
+    h2_rate_HDT: float
+    h2_avail: float
+    h2_buy_cost: float
+    h2_buy_cap: float
+
+    # Penalties
+    penalty_unmet: Dict[str, float]
+
+
+# -------------------------
+# Load utilities
+# -------------------------
 
 def load_data(data_dir):
     crude_yields = pd.read_csv(f"{data_dir}/crude_yields.csv")
@@ -60,66 +103,12 @@ def load_data(data_dir):
     )
 
 
-def _econ_lookup(econ, typ):
+def _econ_lookup(econ: pd.DataFrame, typ: str) -> Dict[str, float]:
     sub = econ[econ["type"] == typ].copy()
     return dict(zip(sub["name"], sub["value"]))
 
 
-def build_and_solve_lp(data, verbose=True):
-    """
-    Refinery planning LP with:
-      - Local minimum demand HARD (served by delivered volumes = refinery + finished imports)
-      - Export minimum demand soft (unmet allowed)
-      - FCC has two severity modes (FCC_G and FCC_D)
-      - HC competes for VGO with FCC
-      - HDT upgrades selected diesel blendstocks into treated diesel stream D_TRT
-      - Feed imports: e.g., VGO import to supplement CDU VGO production
-      - Hydrogen balance (H2 availability + optional H2 purchase)
-
-    Accounting fix:
-      - q_ref[p,m] = refinery-delivered volume to market m
-      - q[p,m]     = delivered volume to market m (refinery + imports)
-      - Revenue is earned on delivered q[p,m]
-    """
-
-    # --- Sets ---
-    crudes = list(data.crude_yields["crude"].unique())
-
-    cuts = ["N", "K", "D", "VGO", "R"]
-    conv_streams = ["G_FCC", "D_FCC", "LPG", "FO", "D_VR", "RFG", "D_HC", "N_HC", "D_TRT"]
-    streams = cuts + conv_streams
-
-    products = ["G", "J", "U", "L", "F"]
-    markets = list(data.markets["market"].unique())
-    local_market_name = "Local"
-    export_markets = [m for m in markets if m != local_market_name]
-
-    # HDT treatable diesel blendstocks
-    treatable = ["D_FCC", "D_VR", "D_HC"]
-
-    # Blending eligibility
-    blend_map = {
-        "G": ["N", "N_HC", "G_FCC", "RFG"],
-        "J": ["K"],
-        "U": ["D", "D_FCC", "D_VR", "D_HC", "D_TRT"],
-        "L": ["LPG"],
-        "F": ["FO"],
-    }
-
-    # --- Parameters ---
-    crude_y = data.crude_yields.set_index("crude")[cuts].to_dict(orient="index")
-    unit_y = data.unit_yields.set_index(["unit", "stream"])["yield"].to_dict()
-
-    qtab = data.qualities.set_index("stream")
-    qual = {}
-    for s in qtab.index:
-        qual[s] = {
-            "RON": float(qtab.loc[s, "RON"]) if not pd.isna(qtab.loc[s, "RON"]) else None,
-            "RVP": float(qtab.loc[s, "RVP"]) if not pd.isna(qtab.loc[s, "RVP"]) else None,
-            "S_ppm": float(qtab.loc[s, "S_ppm"]) if not pd.isna(qtab.loc[s, "S_ppm"]) else None,
-            "CN": float(qtab.loc[s, "CN"]) if not pd.isna(qtab.loc[s, "CN"]) else None,
-        }
-
+def default_params(data: Data) -> LPParams:
     netback = data.markets.set_index(["product", "market"])["netback"].to_dict()
     dmin = data.markets.set_index(["product", "market"])["demand_min"].to_dict()
     dmax = data.markets.set_index(["product", "market"])["demand_max"].to_dict()
@@ -134,19 +123,15 @@ def build_and_solve_lp(data, verbose=True):
     h2_cost = _econ_lookup(data.economics, "h2_cost") if "h2_cost" in set(data.economics["type"]) else {}
     h2_cap = _econ_lookup(data.economics, "h2_cap") if "h2_cap" in set(data.economics["type"]) else {}
 
-    # Defaults so model still runs if you forget rows
     h2_rate_HC = float(h2_rate.get("HC", 0.0))
     h2_rate_HDT = float(h2_rate.get("HDT", 0.0))
     h2_avail = float(h2_supply.get("avail", 0.0))
     h2_buy_cost = float(h2_cost.get("buy", 0.0))
     h2_buy_cap = float(h2_cap.get("buy", 0.0))
 
-    specs = data.specs
-
-    # Export unmet penalty (Local unmet not allowed)
     penalty_unmet = {"G": 500.0, "J": 400.0, "U": 600.0, "L": 200.0, "F": 50.0}
 
-    # Finished imports (optional)
+    # Finished imports
     imp_cost: Dict[Tuple[str, str], float] = {}
     imp_max: Dict[Tuple[str, str], float] = {}
     if len(data.imports) > 0:
@@ -158,7 +143,10 @@ def build_and_solve_lp(data, verbose=True):
             imp_cost[key] = float(r["import_cost"])
             imp_max[key] = float(r["import_max"])
 
-    # Feed imports (optional) (e.g., VGO)
+    # NEW: spot max defaults to total max (scenario layer will disrupt this)
+    imp_spot_max: Dict[Tuple[str, str], float] = dict(imp_max)
+
+    # Feed imports
     feed_cost: Dict[str, float] = {}
     feed_max: Dict[str, float] = {}
     if len(data.feed_imports) > 0:
@@ -170,19 +158,106 @@ def build_and_solve_lp(data, verbose=True):
             feed_cost[feed] = float(r["import_cost"])
             feed_max[feed] = float(r["import_max"])
 
-    # --- Decision variables ---
+    return LPParams(
+        netback=netback,
+        dmin=dmin,
+        dmax=dmax,
+        crude_cost=crude_cost,
+        unit_cost=unit_cost,
+        cap=cap,
+        imp_cost=imp_cost,
+        imp_max=imp_max,
+        imp_spot_max=imp_spot_max,
+        feed_cost=feed_cost,
+        feed_max=feed_max,
+        h2_rate_HC=h2_rate_HC,
+        h2_rate_HDT=h2_rate_HDT,
+        h2_avail=h2_avail,
+        h2_buy_cost=h2_buy_cost,
+        h2_buy_cap=h2_buy_cap,
+        penalty_unmet=penalty_unmet,
+    )
+
+
+# -------------------------
+# LP builder (used by CVaR + deterministic solve)
+# -------------------------
+
+def build_lp_matrices(
+    data: Data,
+    params: Optional[LPParams] = None,
+    spot_premium: float = 0.30,  # recommend 30% so hedging is economically meaningful
+) -> Dict[str, Any]:
+    if params is None:
+        params = default_params(data)
+
+    # --- Sets ---
+    crudes = list(data.crude_yields["crude"].unique())
+
+    cuts = ["N", "K", "D", "VGO", "R"]
+    conv_streams = ["G_FCC", "D_FCC", "LPG", "FO", "D_VR", "RFG", "D_HC", "N_HC", "D_TRT"]
+    streams = cuts + conv_streams
+
+    products = ["G", "J", "U", "L", "F"]
+    markets = list(data.markets["market"].unique())
+    local_market_name = "Local"
+    export_markets = [m for m in markets if m != local_market_name]
+
+    treatable = ["D_FCC", "D_VR", "D_HC"]
+
+    blend_map = {
+        "G": ["N", "N_HC", "G_FCC", "RFG"],
+        "J": ["K"],
+        "U": ["D", "D_FCC", "D_VR", "D_HC", "D_TRT"],
+        "L": ["LPG"],
+        "F": ["FO"],
+    }
+
+    # --- Physical parameters ---
+    crude_y = data.crude_yields.set_index("crude")[cuts].to_dict(orient="index")
+    unit_y = data.unit_yields.set_index(["unit", "stream"])["yield"].to_dict()
+
+    qtab = data.qualities.set_index("stream")
+    qual = {}
+    for s in qtab.index:
+        qual[s] = {
+            "RON": float(qtab.loc[s, "RON"]) if not pd.isna(qtab.loc[s, "RON"]) else None,
+            "RVP": float(qtab.loc[s, "RVP"]) if not pd.isna(qtab.loc[s, "RVP"]) else None,
+            "S_ppm": float(qtab.loc[s, "S_ppm"]) if not pd.isna(qtab.loc[s, "S_ppm"]) else None,
+            "CN": float(qtab.loc[s, "CN"]) if not pd.isna(qtab.loc[s, "CN"]) else None,
+        }
+    specs = data.specs
+
+    # --- Scenario parameters ---
+    netback = params.netback
+    dmin = params.dmin
+    dmax = params.dmax
+    crude_cost = params.crude_cost
+    unit_cost = params.unit_cost
+    cap = params.cap
+    imp_cost = params.imp_cost
+    imp_max = params.imp_max
+    imp_spot_max = params.imp_spot_max
+    feed_cost = params.feed_cost
+    feed_max = params.feed_max
+    h2_rate_HC = params.h2_rate_HC
+    h2_rate_HDT = params.h2_rate_HDT
+    h2_avail = params.h2_avail
+    h2_buy_cost = params.h2_buy_cost
+    h2_buy_cap = params.h2_buy_cap
+    penalty_unmet = params.penalty_unmet
+
+    # --- Variables ---
     var_names: List[str] = []
     idx: Dict[str, int] = {}
 
-    def add_var(name):
+    def add_var(name: str):
         idx[name] = len(var_names)
         var_names.append(name)
 
-    # Crude runs
     for c in crudes:
         add_var(f"x[{c}]")
 
-    # Unit throughputs
     add_var("T[FCC_G]")
     add_var("T[FCC_D]")
     add_var("T[VR]")
@@ -190,46 +265,38 @@ def build_and_solve_lp(data, verbose=True):
     add_var("T[HC]")
     add_var("T[HDT]")
 
-    # Hydrogen purchase
     add_var("H2[buy]")
 
-    # Feed imports (e.g., VGO)
     for feed in sorted(feed_cost.keys()):
         add_var(f"feed_imp[{feed}]")
 
-    # Stream availabilities
     for s in streams:
         add_var(f"y[{s}]")
 
-    # HDT treating amounts
     for s in treatable:
         add_var(f"treat[{s}]")
 
-    # Blending flows
     for p in products:
         for s in blend_map[p]:
             add_var(f"f[{s}->{p}]")
 
-    # Total products
     for p in products:
         add_var(f"Q[{p}]")
 
-    # Refinery-delivered sales by market (excludes finished imports)
     for p in products:
         for m in markets:
             add_var(f"q_ref[{p},{m}]")
 
-    # Delivered sales by market (refinery + imports)
-    # (kept as q[...] so the rest of the model / reporting stays familiar)
     for p in products:
         for m in markets:
             add_var(f"q[{p},{m}]")
 
-    # Finished imports
+    # Contracted + spot imports
     for (p, m) in sorted(imp_cost.keys()):
-        add_var(f"imp[{p},{m}]")
+        add_var(f"imp_fs[{p},{m}]")
+    for (p, m) in sorted(imp_cost.keys()):
+        add_var(f"imp_spot[{p},{m}]")
 
-    # Export unmet only
     for p in products:
         for m in export_markets:
             add_var(f"unmet[{p},{m}]")
@@ -237,50 +304,46 @@ def build_and_solve_lp(data, verbose=True):
     n = len(var_names)
 
     # Bounds
-    bounds: List[Tuple[float, float]] = [(0, None)] * n
+    bounds: List[Tuple[Optional[float], Optional[float]]] = [(0, None)] * n
 
-    # Delivered sales bounds
     for p in products:
         for m in markets:
             bounds[idx[f"q[{p},{m}]"]] = (0.0, float(dmax[(p, m)]))
 
-    # Finished import bounds
+    # Contract imports can go up to total cap
     for (p, m), mx in imp_max.items():
-        bounds[idx[f"imp[{p},{m}]"]] = (0.0, float(mx))
+        bounds[idx[f"imp_fs[{p},{m}]"]] = (0.0, float(mx))
 
-    # Feed import bounds
+    # Spot imports limited by scenario-specific spot availability cap
+    for (p, m), mx in imp_spot_max.items():
+        bounds[idx[f"imp_spot[{p},{m}]"]] = (0.0, float(mx))
+
     for feed, mx in feed_max.items():
         bounds[idx[f"feed_imp[{feed}]"]] = (0.0, float(mx))
 
-    # H2 buy bound
     bounds[idx["H2[buy]"]] = (0.0, float(h2_buy_cap))
 
-    # --- Objective (minimize negative profit) ---
+    # Objective (min loss = cost - revenue)
     cvec = np.zeros(n)
 
-    # Revenues (delivered volumes earn revenue)
     for p in products:
         for m in markets:
             cvec[idx[f"q[{p},{m}]"]] = -float(netback[(p, m)])
 
-    # Finished import costs
     for (p, m), cost in imp_cost.items():
-        cvec[idx[f"imp[{p},{m}]"]] += float(cost)
+        cvec[idx[f"imp_fs[{p},{m}]"]] += float(cost)
+        cvec[idx[f"imp_spot[{p},{m}]"]] += float(cost) * (1.0 + float(spot_premium))
 
-    # Feed import costs
     for feed, cost in feed_cost.items():
         cvec[idx[f"feed_imp[{feed}]"]] += float(cost)
 
-    # Export unmet penalty
     for p in products:
         for m in export_markets:
             cvec[idx[f"unmet[{p},{m}]"]] = float(penalty_unmet[p])
 
-    # Crude costs + CDU variable cost
     for c in crudes:
         cvec[idx[f"x[{c}]"]] = float(crude_cost[c]) + float(unit_cost["CDU"])
 
-    # Unit variable costs
     cvec[idx["T[FCC_G]"]] += float(unit_cost["FCC"])
     cvec[idx["T[FCC_D]"]] += float(unit_cost["FCC"])
     cvec[idx["T[VR]"]] += float(unit_cost["VR"])
@@ -288,24 +351,23 @@ def build_and_solve_lp(data, verbose=True):
     cvec[idx["T[HC]"]] += float(unit_cost["HC"])
     cvec[idx["T[HDT]"]] += float(unit_cost["HDT"])
 
-    # Hydrogen purchase cost
     cvec[idx["H2[buy]"]] += float(h2_buy_cost)
 
-    # --- Constraints ---
+    # Constraints
     A_eq, b_eq = [], []
     A_ub, b_ub = [], []
 
-    def eq(row, rhs):
+    def eq(row: Dict[str, float], rhs: float):
         r = np.zeros(n)
-        for name, val_ in row.items():
-            r[idx[name]] = val_
+        for nm, val_ in row.items():
+            r[idx[nm]] = val_
         A_eq.append(r)
         b_eq.append(rhs)
 
-    def ub(row, rhs):
+    def ub(row: Dict[str, float], rhs: float):
         r = np.zeros(n)
-        for name, val_ in row.items():
-            r[idx[name]] = val_
+        for nm, val_ in row.items():
+            r[idx[nm]] = val_
         A_ub.append(r)
         b_ub.append(rhs)
 
@@ -319,7 +381,7 @@ def build_and_solve_lp(data, verbose=True):
             row[f"x[{c}]"] = -float(crude_y[c][s])
         eq(row, 0.0)
 
-    # 3) VGO allocation: FCC + HC <= VGO + VGO_import
+    # 3) VGO allocation
     vgo_row = {"T[FCC_G]": 1.0, "T[FCC_D]": 1.0, "T[HC]": 1.0, "y[VGO]": -1.0}
     if "VGO" in feed_cost:
         vgo_row["feed_imp[VGO]"] = -1.0
@@ -329,43 +391,26 @@ def build_and_solve_lp(data, verbose=True):
     ub({"T[VR]": 1.0, "y[R]": -1.0}, 0.0)
 
     # 5) Conversion yields
-    eq(
-        {
-            "y[G_FCC]": 1.0,
-            "T[FCC_G]": -float(unit_y[("FCC_G", "G_FCC")]),
-            "T[FCC_D]": -float(unit_y[("FCC_D", "G_FCC")]),
-        },
-        0.0,
-    )
-    eq(
-        {
-            "y[D_FCC]": 1.0,
-            "T[FCC_G]": -float(unit_y[("FCC_G", "D_FCC")]),
-            "T[FCC_D]": -float(unit_y[("FCC_D", "D_FCC")]),
-        },
-        0.0,
-    )
-    eq(
-        {
-            "y[LPG]": 1.0,
-            "T[FCC_G]": -float(unit_y[("FCC_G", "LPG")]),
-            "T[FCC_D]": -float(unit_y[("FCC_D", "LPG")]),
-        },
-        0.0,
-    )
+    eq({"y[G_FCC]": 1.0,
+        "T[FCC_G]": -float(unit_y[("FCC_G", "G_FCC")]),
+        "T[FCC_D]": -float(unit_y[("FCC_D", "G_FCC")])}, 0.0)
+
+    eq({"y[D_FCC]": 1.0,
+        "T[FCC_G]": -float(unit_y[("FCC_G", "D_FCC")]),
+        "T[FCC_D]": -float(unit_y[("FCC_D", "D_FCC")])}, 0.0)
+
+    eq({"y[LPG]": 1.0,
+        "T[FCC_G]": -float(unit_y[("FCC_G", "LPG")]),
+        "T[FCC_D]": -float(unit_y[("FCC_D", "LPG")])}, 0.0)
 
     eq({"y[D_HC]": 1.0, "T[HC]": -float(unit_y[("HC", "D_HC")])}, 0.0)
     eq({"y[N_HC]": 1.0, "T[HC]": -float(unit_y[("HC", "N_HC")])}, 0.0)
-
     eq({"y[RFG]": 1.0, "T[REF]": -float(unit_y[("REF", "RFG")])}, 0.0)
-
     eq({"y[FO]": 1.0, "T[VR]": -float(unit_y[("VR", "FO")])}, 0.0)
     eq({"y[D_VR]": 1.0, "T[VR]": -float(unit_y[("VR", "D_VR")])}, 0.0)
 
-    # 5b) HDT: D_TRT = sum treat[s]
+    # 5b/5c) HDT
     eq({"y[D_TRT]": 1.0, **{f"treat[{s}]": -1.0 for s in treatable}}, 0.0)
-
-    # 5c) Define T[HDT] = sum treat[s]
     eq({"T[HDT]": 1.0, **{f"treat[{s}]": -1.0 for s in treatable}}, 0.0)
 
     # 6) Unit capacities
@@ -375,10 +420,10 @@ def build_and_solve_lp(data, verbose=True):
     ub({"T[HC]": 1.0}, float(cap["HC"]))
     ub({"T[HDT]": 1.0}, float(cap["HDT"]))
 
-    # 6b) Hydrogen balance: H2_req <= H2_avail + H2_buy
+    # 6b) Hydrogen balance
     ub({"T[HC]": h2_rate_HC, "T[HDT]": h2_rate_HDT, "H2[buy]": -1.0}, float(h2_avail))
 
-    # 7) Stream availability (treating removes material; N to reformer)
+    # 7) Stream availability
     for s in streams:
         used = [(s, p) for p in products if s in blend_map[p]]
         if not used and s != "N":
@@ -403,32 +448,37 @@ def build_and_solve_lp(data, verbose=True):
             row[f"f[{s}->{p}]"] = -1.0
         eq(row, 0.0)
 
-    # 9) Refinery sales balance (Q is refinery production only)
+    # 9) Refinery sales balance (Q is refinery production)
     for p in products:
         row = {f"Q[{p}]": 1.0}
         for m in markets:
             row[f"q_ref[{p},{m}]"] = -1.0
         eq(row, 0.0)
 
-    # 9a) Delivered sales definition: delivered = refinery + finished imports
+    # 9a) Delivered identity: q = q_ref + imp_fs + imp_spot
     for p in products:
         for m in markets:
             row = {f"q[{p},{m}]": 1.0, f"q_ref[{p},{m}]": -1.0}
             if (p, m) in imp_cost:
-                row[f"imp[{p},{m}]"] = -1.0
+                row[f"imp_fs[{p},{m}]"] = -1.0
+                row[f"imp_spot[{p},{m}]"] = -1.0
             eq(row, 0.0)
 
-    # 9b) HARD Local minimums (delivered): q >= dmin  -> -q <= -dmin
+    # 9b) TOTAL import cap: imp_fs + imp_spot <= imp_max
+    for (p, m), mx in imp_max.items():
+        ub({f"imp_fs[{p},{m}]": 1.0, f"imp_spot[{p},{m}]": 1.0}, float(mx))
+
+    # 9c) HARD Local mins (delivered)
     for p in products:
         m = local_market_name
         ub({f"q[{p},{m}]": -1.0}, -float(dmin[(p, m)]))
 
-    # 9c) SOFT Export minimums (delivered): q + unmet >= dmin
+    # 9d) SOFT Export mins (delivered)
     for p in products:
         for m in export_markets:
             ub({f"q[{p},{m}]": -1.0, f"unmet[{p},{m}]": -1.0}, -float(dmin[(p, m)]))
 
-    # 10) Blending specs
+    # 10) Specs
     row = {"Q[G]": float(specs.RON_min)}
     for s in blend_map["G"]:
         if qual[s]["RON"] is None:
@@ -457,33 +507,84 @@ def build_and_solve_lp(data, verbose=True):
         row[f"f[{s}->U]"] = -float(qual[s]["CN"])
     ub(row, 0.0)
 
-    # --- Solve ---
+    return {
+        "c": cvec,
+        "A_ub": np.array(A_ub) if A_ub else None,
+        "b_ub": np.array(b_ub) if b_ub else None,
+        "A_eq": np.array(A_eq) if A_eq else None,
+        "b_eq": np.array(b_eq) if b_eq else None,
+        "bounds": bounds,
+        "idx": idx,
+        "var_names": var_names,
+        "meta": {
+            "crudes": crudes,
+            "products": products,
+            "markets": markets,
+            "local_market_name": local_market_name,
+            "export_markets": export_markets,
+            "spot_premium": float(spot_premium),
+        },
+        "params": params,
+    }
+
+
+# -------------------------
+# Deterministic solve wrapper
+# -------------------------
+
+def build_and_solve_lp(data: Data, params: Optional[LPParams] = None, verbose: bool = True):
+    lp = build_lp_matrices(data, params=params)
+    params_used: LPParams = lp["params"]
+
     res = linprog(
-        c=cvec,
-        A_ub=np.array(A_ub) if A_ub else None,
-        b_ub=np.array(b_ub) if b_ub else None,
-        A_eq=np.array(A_eq) if A_eq else None,
-        b_eq=np.array(b_eq) if b_eq else None,
-        bounds=bounds,
+        c=lp["c"],
+        A_ub=lp["A_ub"],
+        b_ub=lp["b_ub"],
+        A_eq=lp["A_eq"],
+        b_eq=lp["b_eq"],
+        bounds=lp["bounds"],
         method="highs",
     )
     if not res.success:
         raise RuntimeError(f"LP solve failed: {res.message}")
 
     x = res.x
+    idx = lp["idx"]
+    meta = lp["meta"]
 
     def val(name: str) -> float:
         return float(x[idx[name]])
 
-    # --- Reporting ---
+    crudes = meta["crudes"]
+    products = meta["products"]
+    markets = meta["markets"]
+    local_market_name = meta["local_market_name"]
+    export_markets = meta["export_markets"]
+    spot_premium = meta["spot_premium"]
+
+    cap = params_used.cap
+    unit_cost = params_used.unit_cost
+    crude_cost = params_used.crude_cost
+    netback = params_used.netback
+    imp_cost = params_used.imp_cost
+    feed_cost = params_used.feed_cost
+    penalty_unmet = params_used.penalty_unmet
+    h2_rate_HC = params_used.h2_rate_HC
+    h2_rate_HDT = params_used.h2_rate_HDT
+    h2_avail = params_used.h2_avail
+    h2_buy_cost = params_used.h2_buy_cost
+
+    # Reporting tables
     crude_df = pd.DataFrame({"crude": crudes, "run_kbpd": [val(f"x[{c}]") for c in crudes]})
     crude_df["share_%"] = 100 * crude_df["run_kbpd"] / max(crude_df["run_kbpd"].sum(), 1e-9)
 
     fcc_g = val("T[FCC_G]")
     fcc_d = val("T[FCC_D]")
     fcc_total = fcc_g + fcc_d
+
     fcc_split_df = pd.DataFrame(
-        [["FCC_G", fcc_g, 100 * fcc_g / max(fcc_total, 1e-9)], ["FCC_D", fcc_d, 100 * fcc_d / max(fcc_total, 1e-9)]],
+        [["FCC_G", fcc_g, 100 * fcc_g / max(fcc_total, 1e-9)],
+         ["FCC_D", fcc_d, 100 * fcc_d / max(fcc_total, 1e-9)]],
         columns=["mode", "throughput_kbpd", "share_%"],
     )
 
@@ -501,7 +602,6 @@ def build_and_solve_lp(data, verbose=True):
     )
     unit_df["util_%"] = 100 * unit_df["throughput_kbpd"] / unit_df["capacity_kbpd"]
 
-    # Product table
     prod_rows = []
     for p in products:
         row = {"product": p, "refinery_kbpd": val(f"Q[{p}]")}
@@ -509,22 +609,43 @@ def build_and_solve_lp(data, verbose=True):
         m = local_market_name
         row[f"{m}_delivered_kbpd"] = val(f"q[{p},{m}]")
         row[f"{m}_refinery_kbpd"] = val(f"q_ref[{p},{m}]")
-        row[f"{m}_import_kbpd"] = val(f"imp[{p},{m}]") if (p, m) in imp_cost else 0.0
+
+        if (p, m) in imp_cost:
+            fs = val(f"imp_fs[{p},{m}]")
+            sp = val(f"imp_spot[{p},{m}]")
+            row[f"{m}_import_kbpd"] = fs + sp
+            row[f"{m}_import_fs_kbpd"] = fs
+            row[f"{m}_import_spot_kbpd"] = sp
+        else:
+            row[f"{m}_import_kbpd"] = 0.0
+            row[f"{m}_import_fs_kbpd"] = 0.0
+            row[f"{m}_import_spot_kbpd"] = 0.0
+
         row[f"{m}_unmet_kbpd"] = 0.0
 
         for em in export_markets:
             row[f"{em}_delivered_kbpd"] = val(f"q[{p},{em}]")
             row[f"{em}_refinery_kbpd"] = val(f"q_ref[{p},{em}]")
-            row[f"{em}_import_kbpd"] = val(f"imp[{p},{em}]") if (p, em) in imp_cost else 0.0
+
+            if (p, em) in imp_cost:
+                fs = val(f"imp_fs[{p},{em}]")
+                sp = val(f"imp_spot[{p},{em}]")
+                row[f"{em}_import_kbpd"] = fs + sp
+                row[f"{em}_import_fs_kbpd"] = fs
+                row[f"{em}_import_spot_kbpd"] = sp
+            else:
+                row[f"{em}_import_kbpd"] = 0.0
+                row[f"{em}_import_fs_kbpd"] = 0.0
+                row[f"{em}_import_spot_kbpd"] = 0.0
+
             row[f"{em}_unmet_kbpd"] = val(f"unmet[{p},{em}]")
 
         prod_rows.append(row)
+
     prod_df = pd.DataFrame(prod_rows)
 
-    # Feed imports report
     vgo_imp = val("feed_imp[VGO]") if "feed_imp[VGO]" in idx else 0.0
 
-    # Hydrogen report
     h2_req = h2_rate_HC * val("T[HC]") + h2_rate_HDT * val("T[HDT]")
     h2_buy = val("H2[buy]")
     h2_df = pd.DataFrame(
@@ -532,7 +653,6 @@ def build_and_solve_lp(data, verbose=True):
         columns=["H2_required", "H2_free_avail", "H2_purchased", "H2_short"],
     )
 
-    # Economics (revenue on delivered volumes)
     revenue = sum(netback[(p, m)] * val(f"q[{p},{m}]") for p in products for m in markets)
     crude_cost_total = sum(crude_cost[c] * val(f"x[{c}]") for c in crudes)
 
@@ -544,7 +664,13 @@ def build_and_solve_lp(data, verbose=True):
         + unit_cost["HC"] * val("T[HC]")
         + unit_cost["HDT"] * val("T[HDT]")
     )
-    finished_import_cost_total = sum(imp_cost[(p, m)] * val(f"imp[{p},{m}]") for (p, m) in imp_cost)
+
+    finished_import_cost_total = 0.0
+    for (p, m), cost in imp_cost.items():
+        fs = val(f"imp_fs[{p},{m}]")
+        sp = val(f"imp_spot[{p},{m}]")
+        finished_import_cost_total += cost * fs + cost * (1.0 + spot_premium) * sp
+
     feed_import_cost_total = sum(feed_cost[feed] * val(f"feed_imp[{feed}]") for feed in feed_cost)
     h2_purchase_cost_total = h2_buy_cost * h2_buy
     unmet_pen = sum(penalty_unmet[p] * val(f"unmet[{p},{m}]") for p in products for m in export_markets)
@@ -590,7 +716,7 @@ def build_and_solve_lp(data, verbose=True):
         print("\n=== HYDROGEN BALANCE ===")
         print(h2_df.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
 
-        print("\n=== PRODUCT DELIVERIES (split refinery vs imports) ===")
+        print("\n=== PRODUCT DELIVERIES (with contracted + spot imports) ===")
         print(prod_df.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
 
         print("\n=== ECONOMICS ===")
@@ -605,5 +731,5 @@ def build_and_solve_lp(data, verbose=True):
         "hydrogen": h2_df,
         "products": prod_df,
         "economics": econ_df,
-        "raw": {"status": res.status, "message": res.message, "objective_min": float(res.fun)},
+        "raw": {"status": res.status, "message": res.message, "objective_min": float(res.fun), "n_vars": len(lp["var_names"])},
     }
