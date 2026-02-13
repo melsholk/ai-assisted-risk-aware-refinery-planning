@@ -138,9 +138,6 @@ The ML surrogate closely matches oracle performance in moderate risk regimes and
 
 # 6. Frontier Replication Example
 
-Place these images in:
-
-    docs/images/
 
 ### Efficient Frontier (Expected vs CVaR Profit)
 
