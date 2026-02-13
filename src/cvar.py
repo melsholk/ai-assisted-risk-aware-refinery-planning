@@ -23,7 +23,7 @@ class CVaRResult:
     cvar_loss: float
 
 
-def _weighted_var_cvar_loss(losses: np.ndarray, probs: np.ndarray, alpha: float) -> tuple[float, float]:
+def _weighted_var_cvar_loss(losses, probs, alpha):
     """
     Compute VaR_alpha(loss) and CVaR_alpha(loss) for a discrete distribution.
     losses: shape (S,)
@@ -47,12 +47,12 @@ def _weighted_var_cvar_loss(losses: np.ndarray, probs: np.ndarray, alpha: float)
 
 
 def solve_cvar_extensive_form(
-    data: Data,
-    scenarios: List[Scenario],
-    alpha: float = 0.90,
-    lam: float = 1.0,
-    first_stage_vars: List[str] | None = None,
-) -> CVaRResult:
+    data,
+    scenarios,
+    alpha = 0.90,
+    lam = 1.0,
+    first_stage_vars = None,
+):
     if not (0.0 < alpha < 1.0):
         raise ValueError("alpha must be in (0,1)")
     if lam < 0:

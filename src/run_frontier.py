@@ -9,7 +9,7 @@ from src.scenarios import generate_scenarios, Scenario
 from src.cvar import solve_cvar_extensive_form
 
 
-def weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+def weighted_quantile(values, weights, q):
     """Weighted quantile at q in [0,1]."""
     v = np.asarray(values, dtype=float)
     w = np.asarray(weights, dtype=float)
@@ -28,7 +28,7 @@ def weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> floa
     return float(np.interp(q, cw, v))
 
 
-def weighted_cvar_lower_tail(values: np.ndarray, weights: np.ndarray, tail_mass: float) -> float:
+def weighted_cvar_lower_tail(values, weights, tail_mass):
     """
     Weighted CVaR of the LOWER tail of `values`, with tail mass = tail_mass.
     Example: tail_mass = 0.10 => mean of worst 10% outcomes.

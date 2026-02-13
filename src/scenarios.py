@@ -14,19 +14,19 @@ class Scenario:
     params: LPParams
 
 
-def _copy_with(base: LPParams, **overrides) -> LPParams:
+def _copy_with(base, **overrides):
     d = dict(base.__dict__)
     d.update(overrides)
     return LPParams(**d)
 
 
 def generate_scenarios(
-    base: LPParams,
-    n: int = 50,
-    seed: int = 1,
-    alpha_tail: float = 0.10,
-    enable_import_cap_risk: bool = False,
-) -> List[Scenario]:
+    base,
+    n = 50,
+    seed = 1,
+    alpha_tail = 0.10,
+    enable_import_cap_risk = False,
+):
     """
     Scenario generator with:
       - 2-factor netback shocks (market level M, spread tilt S)
@@ -70,8 +70,8 @@ def generate_scenarios(
     for p in prods:
         var_log[p] = (a[p] ** 2) * (sigma_M ** 2) + (b[p] ** 2) * (sigma_S ** 2) + (sigma_eps[p] ** 2)
 
-    raw_params: List[LPParams] = []
-    stress_scores: List[float] = []
+    raw_params = []
+    stress_scores = []
 
     for i in range(n):
         M = rng.normal(0.0, sigma_M)
@@ -134,7 +134,7 @@ def generate_scenarios(
     w[stress_scores >= thresh] = 2.0
     probs = w / w.sum()
 
-    scenarios: List[Scenario] = []
+    scenarios = []
     for i in range(n):
         scenarios.append(Scenario(name=f"s{i:03d}", prob=float(probs[i]), params=raw_params[i]))
 

@@ -103,12 +103,12 @@ def load_data(data_dir):
     )
 
 
-def _econ_lookup(econ: pd.DataFrame, typ: str) -> Dict[str, float]:
+def _econ_lookup(econ, typ):
     sub = econ[econ["type"] == typ].copy()
     return dict(zip(sub["name"], sub["value"]))
 
 
-def default_params(data: Data) -> LPParams:
+def default_params(data):
     netback = data.markets.set_index(["product", "market"])["netback"].to_dict()
     dmin = data.markets.set_index(["product", "market"])["demand_min"].to_dict()
     dmax = data.markets.set_index(["product", "market"])["demand_max"].to_dict()
@@ -184,10 +184,10 @@ def default_params(data: Data) -> LPParams:
 # -------------------------
 
 def build_lp_matrices(
-    data: Data,
-    params: Optional[LPParams] = None,
-    spot_premium: float = 0.30,  # recommend 30% so hedging is economically meaningful
-) -> Dict[str, Any]:
+    data,
+    params = None,
+    spot_premium = 0.30,  # recommend 30% so hedging is economically meaningful
+):
     if params is None:
         params = default_params(data)
 
@@ -357,14 +357,14 @@ def build_lp_matrices(
     A_eq, b_eq = [], []
     A_ub, b_ub = [], []
 
-    def eq(row: Dict[str, float], rhs: float):
+    def eq(row, rhs):
         r = np.zeros(n)
         for nm, val_ in row.items():
             r[idx[nm]] = val_
         A_eq.append(r)
         b_eq.append(rhs)
 
-    def ub(row: Dict[str, float], rhs: float):
+    def ub(row, rhs):
         r = np.zeros(n)
         for nm, val_ in row.items():
             r[idx[nm]] = val_
@@ -532,7 +532,7 @@ def build_lp_matrices(
 # Deterministic solve wrapper
 # -------------------------
 
-def build_and_solve_lp(data: Data, params: Optional[LPParams] = None, verbose: bool = True):
+def build_and_solve_lp(data, params = None, verbose = True):
     lp = build_lp_matrices(data, params=params)
     params_used: LPParams = lp["params"]
 

@@ -1,3 +1,7 @@
 numpy
 pandas
 scipy
+scikit-learn
+joblib
+pyarrow
+matplotlib
