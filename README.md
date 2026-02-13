@@ -15,7 +15,7 @@ It combines:
 
 ---
 
-## 🔥 Key Result
+##  Key Result
 
 A distribution-aware ML surrogate approximates CVaR refinery planning decisions with:
 
@@ -144,7 +144,7 @@ Place these images in:
 
 ### Efficient Frontier (Expected vs CVaR Profit)
 
-![Frontier Comparison](outputs/figures/frontier_compare_seed123.png)
+![Frontier Comparison](outputs/figures/frontier_oracle_vs_ml_seed123.png)
 
 ### CVaR vs λ
 
