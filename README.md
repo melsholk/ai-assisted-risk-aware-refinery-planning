@@ -1,5 +1,22 @@
 # AI-Assisted Risk-Aware Refinery Planning Optimization
 
+## Summary
+
+I built a stochastic refinery planning model in Python that extends a PIMS-style LP into a risk-aware framework.
+
+First, I implemented a deterministic refinery LP with crude slate decisions, conversion units, hydrogen balance, blending constraints, and multi-market sales.
+
+Then I added correlated Monte Carlo scenario generation for product netbacks, crude costs, hydrogen availability, and optional disruption.
+
+On top of that, I implemented an extensive-form CVaR model, enforcing non-anticipativity across first-stage decisions like crude runs and unit throughputs. This allowed me to compute efficient frontiers as a function of risk aversion.
+
+Because solving the full CVaR model is computationally expensive, I trained a machine learning surrogate to approximate the optimal first-stage decision policy as a function of scenario distribution statistics and the risk parameter.
+
+The surrogate, combined with a feasibility restoration LP, achieved near-zero median profit gap on held-out scenario sets and about a 2.8× speedup compared to solving the full stochastic program.
+
+So the project demonstrates how stochastic programming and ML can be combined to approximate risk-aware refinery planning decisions efficiently.
+
+
 This project implements a **risk-aware refinery planning model** under correlated uncertainty and builds a **machine learning surrogate policy** that approximates optimal CVaR decisions.
 
 It combines:
